@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Air Sketch — A-Frame</title>
+  <script src="https://aframe.io/releases/1.7.0/aframe.min.js"></script>
+  <script>
+  /* =========================================================
+     AIR SKETCH
+     Right hand  : pinch (or trigger) and move = draw
+     Left hand   : quick pinch = next color
+                   hold pinch 1 second = clear (like gaze fuse!)
+     Desktop     : Shift + drag = draw, C = color, X = clear,
+                   WASD = walk around your drawing
+     ========================================================= */
+
+  const COLORS = ['#3478C9', '#FF4D6D', '#FFD23F', '#2EC4B6', 'rainbow'];
+
+  // Shows feedback in the information panel
+  function say(msg, color) {
+    const t = document.querySelector('#messageText');
+    t.setAttribute('value', msg);
+    if (color) t.setAttribute('color', color);
+  }
+
+  /* ---------- 1. THE CANVAS ----------
+     Every stroke is made of small "ink dots".
+     One InstancedMesh draws thousands of them in one go,
+     so it stays fast in a headset. This is the only real three.js. */
+  AFRAME.registerComponent('sketch', {
+    init() {
+      this.max = 15000;
+      this.colorIndex = 0;
+      this.color = new THREE.Color();
+      this.dummy = new THREE.Object3D();
+      this.step = new THREE.Vector3();
+      this.last = null;
+
+      const dot = new THREE.SphereGeometry(0.007, 8, 6);
+      const ink = new THREE.MeshStandardMaterial({ roughness: 0.35 });
+      this.mesh = new THREE.InstancedMesh(dot, ink, this.max);
+      for (let i = 0; i < this.max; i++) this.mesh.setColorAt(i, this.color.set('#fff'));
+      this.mesh.count = 0;
+      this.mesh.frustumCulled = false;
+      this.el.object3D.add(this.mesh);
+    },
+
+    // Add ink at a world position, filling gaps when the hand moves fast
+    addPoint(p) {
+      if (!this.last) { this.place(p); this.last = p.clone(); return; }
+      const dist = this.last.distanceTo(p);
+      if (dist < 0.004) return;
+      const steps = Math.ceil(dist / 0.004);
+      for (let i = 1; i <= steps; i++) this.place(this.step.lerpVectors(this.last, p, i / steps));
+      this.last.copy(p);
+    },
+
+    place(p) {
+      const m = this.mesh;
+      if (m.count >= this.max) return say('CANVAS FULL - HOLD LEFT TO CLEAR');
+      this.dummy.position.copy(p);
+      this.dummy.updateMatrix();
+      m.setMatrixAt(m.count, this.dummy.matrix);
+
+      const c = COLORS[this.colorIndex];
+      if (c === 'rainbow') this.color.setHSL((m.count * 0.0015) % 1, 0.85, 0.6);
+      else this.color.set(c);
+      m.setColorAt(m.count, this.color);
+
+      m.count++;
+      m.instanceMatrix.needsUpdate = true;
+      m.instanceColor.needsUpdate = true;
+    },
+
+    endStroke() { this.last = null; },
+
+    nextColor() {
+      this.colorIndex = (this.colorIndex + 1) % COLORS.length;
+      const c = COLORS[this.colorIndex];
+      say('COLOR: ' + (c === 'rainbow' ? 'RAINBOW' : c), c === 'rainbow' ? '#FFFFFF' : c);
+    },
+
+    clear() {
+      this.mesh.count = 0;
+      this.last = null;
+      say('CANVAS CLEARED', '#FFFFFF');
+    }
+  });
+
+  /* ---------- 2. THE PEN (gesture) ----------
+     Works for tracked hands (pinch) AND controllers (trigger).
+     role: draw    = right hand
+     role: palette = left hand (tap = color, hold = clear) */
+  AFRAME.registerComponent('pen', {
+    schema: { role: { default: 'draw' } },
+
+    init() {
+      this.tip = new THREE.Vector3();
+      this.down = false;
+
+      const start = (e) => {
+        this.down = true;
+        this.usingHand = (e.type === 'pinchstarted');
+        if (this.usingHand) this.tip.copy(e.detail.position);
+        this.t0 = performance.now();
+        this.warned = false;
+        this.fired = false;
+      };
+
+      const end = () => {
+        if (!this.down) return;
+        this.down = false;
+        const sketch = this.el.sceneEl.components.sketch;
+        const held = performance.now() - this.t0;
+
+        if (this.data.role === 'draw') sketch.endStroke();
+        else if (held < 300) sketch.nextColor();            // quick tap
+        else if (!this.fired) say('CLEAR CANCELLED', '#FFFFFF'); // let go too early
+      };
+
+      this.el.addEventListener('pinchstarted', start);   // hand tracking
+      this.el.addEventListener('triggerdown', start);    // controllers
+      this.el.addEventListener('pinchmoved', (e) => this.tip.copy(e.detail.position));
+      this.el.addEventListener('pinchended', end);
+      this.el.addEventListener('triggerup', end);
+    },
+
+    tick() {
+      if (!this.down) return;
+      const sketch = this.el.sceneEl.components.sketch;
+
+      if (this.data.role === 'draw') {
+        // Controllers: draw from a point 5 cm in front of the controller
+        if (!this.usingHand) this.el.object3D.localToWorld(this.tip.set(0, 0, -0.05));
+        sketch.addPoint(this.tip);
+        return;
+      }
+
+      // Left hand: hold to clear, with feedback while you wait (same idea as fuse)
+      const held = performance.now() - this.t0;
+      if (held > 300 && !this.warned) { this.warned = true; say('KEEP HOLDING TO CLEAR...', '#FFD23F'); }
+      if (held > 1000 && !this.fired) { this.fired = true; sketch.clear(); }
+    }
+  });
+
+  /* ---------- 3. DESKTOP FALLBACK ----------
+     Shift + drag draws on an invisible surface 1.5 m in front of you. */
+  AFRAME.registerComponent('mouse-pen', {
+    init() {
+      this.ray = new THREE.Raycaster();
+      this.ndc = new THREE.Vector2();
+      this.p = new THREE.Vector3();
+      this.down = false;
+      const sketch = () => this.el.components.sketch;
+
+      window.addEventListener('mousedown', (e) => {
+        if (!e.shiftKey) return;   // plain drag still looks around
+        e.stopPropagation();       // stop look-controls from rotating
+        this.down = true;
+        this.move(e);
+      }, true);
+      window.addEventListener('mousemove', (e) => { if (this.down) this.move(e); });
+      window.addEventListener('mouseup', () => {
+        if (this.down) { this.down = false; sketch().endStroke(); }
+      });
+      window.addEventListener('keydown', (e) => {
+        if (e.key === 'c') sketch().nextColor();
+        if (e.key === 'x') sketch().clear();
+      });
+    },
+
+    move(e) {
+      const r = this.el.canvas.getBoundingClientRect();
+      this.ndc.set(((e.clientX - r.left) / r.width) * 2 - 1,
+                  -((e.clientY - r.top) / r.height) * 2 + 1);
+      this.ray.setFromCamera(this.ndc, this.el.camera);
+      this.ray.ray.at(1.5, this.p);
+      this.el.components.sketch.addPoint(this.p);
+    }
+  });
+  </script>
+</head>
+
+<body>
+  <a-scene sketch mouse-pen
+           webxr="optionalFeatures: hand-tracking, local-floor"
+           background="color: #0b0d12">
+
+    <!-- Light (needed so the ink looks 3D) -->
+    <a-entity light="type: hemisphere; color: #FFFFFF; groundColor: #334455; intensity: 1.2"></a-entity>
+    <a-entity light="type: directional; intensity: 0.8" position="1 3 2"></a-entity>
+
+    <!-- Floor -->
+    <a-circle radius="6" rotation="-90 0 0" color="#161A22"></a-circle>
+
+    <!-- Information panel (same as Requirement 3) -->
+    <!-- wrap-count keeps each line on ONE row so lines never overlap -->
+    <a-plane position="0 2.0 -2.5" width="3.5" height="1.15" color="#111111"></a-plane>
+    <a-text id="messageText" value="PINCH TO DRAW"
+            position="0 2.38 -2.49" align="center" color="#3478C9"
+            width="3.2" wrap-count="34"></a-text>
+    <a-text value="RIGHT pinch / trigger: draw"
+            position="0 2.14 -2.49" align="center" color="#CCCCCC"
+            width="3.2" wrap-count="60"></a-text>
+    <a-text value="LEFT tap: change color"
+            position="0 1.99 -2.49" align="center" color="#CCCCCC"
+            width="3.2" wrap-count="60"></a-text>
+    <a-text value="LEFT hold 1 second: clear"
+            position="0 1.84 -2.49" align="center" color="#CCCCCC"
+            width="3.2" wrap-count="60"></a-text>
+    <a-text value="Desktop: Shift + drag to draw   C color   X clear   WASD walk"
+            position="0 1.62 -2.49" align="center" color="#888888"
+            width="3.2" wrap-count="70"></a-text>
+
+    <!-- Camera -->
+    <a-camera position="0 1.6 0"></a-camera>
+
+    <!-- Tracked hands (pinch) -->
+    <a-entity hand-tracking-controls="hand: right; modelColor: #CCCCDD" pen="role: draw"></a-entity>
+    <a-entity hand-tracking-controls="hand: left;  modelColor: #CCCCDD" pen="role: palette"></a-entity>
+
+    <!-- Controllers (trigger) -->
+    <a-entity hand-controls="hand: right; color: #CCCCDD" pen="role: draw"></a-entity>
+    <a-entity hand-controls="hand: left;  color: #CCCCDD" pen="role: palette"></a-entity>
+
+  </a-scene>
+</body>
+</html>
